@@ -2,7 +2,6 @@
   "name": "electron-app",
   "version": "1.0.0",
   "main": "dist/main.js",
-  "type": "module",
   "scripts": {
     "start": "npm run build && electron .",
     "build": "tsc",
@@ -13,7 +12,11 @@
   "license": "ISC",
   "description": "",
   "devDependencies": {
+    "@types/express": "^5.0.4",
     "electron": "^38.4.0",
     "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
   }
 }

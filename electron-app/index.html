@@ -2,9 +2,84 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>Hello World</title>
+    <title>Stormworks Video Streamer</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; }
+        .control-group { margin-bottom: 15px; }
+        label { margin-right: 10px; }
+        input { width: 80px; }
+        button { margin-right: 10px; }
+        #status { font-weight: bold; }
+        .running { color: green; }
+        .stopped { color: red; }
+        .error { color: orange; }
+    </style>
 </head>
 <body>
-    <h1>Hello World!</h1>
+    <h1>Stormworks Video Streamer</h1>
+
+    <div class="control-group">
+        <label for="port">Server Port:</label>
+        <input type="number" id="port" value="8000">
+    </div>
+
+    <div class="control-group">
+        <button id="startButton">Start Server</button>
+        <button id="stopButton" disabled>Stop Server</button>
+    </div>
+
+    <div class="control-group">
+        <p>Status: <span id="status" class="stopped">Stopped</span></p>
+        <p id="status-details"></p>
+    </div>
+
+    <script>
+        const portInput = document.getElementById('port');
+        const startButton = document.getElementById('startButton');
+        const stopButton = document.getElementById('stopButton');
+        const statusEl = document.getElementById('status');
+        const statusDetailsEl = document.getElementById('status-details');
+
+        startButton.addEventListener('click', () => {
+            const port = parseInt(portInput.value, 10);
+            if (port > 0) {
+                window.api.startServer(port);
+            }
+        });
+
+        stopButton.addEventListener('click', () => {
+            window.api.stopServer();
+        });
+
+        // メインプロセスからのサーバー状態通知をリッスン
+        window.api.onServerStatus((status, ...args) => {
+            switch (status) {
+                case 'running':
+                    statusEl.textContent = `Running on port ${args[0]}`;
+                    statusEl.className = 'running';
+                    statusDetailsEl.textContent = '';
+                    startButton.disabled = true;
+                    stopButton.disabled = false;
+                    portInput.disabled = true;
+                    break;
+                case 'stopped':
+                    statusEl.textContent = 'Stopped';
+                    statusEl.className = 'stopped';
+                    statusDetailsEl.textContent = '';
+                    startButton.disabled = false;
+                    stopButton.disabled = true;
+                    portInput.disabled = false;
+                    break;
+                case 'error':
+                    statusEl.textContent = 'Error';
+                    statusEl.className = 'error';
+                    statusDetailsEl.textContent = `Error: ${args[0]}`;
+                    startButton.disabled = false;
+                    stopButton.disabled = true;
+                    portInput.disabled = false;
+                    break;
+            }
+        });
+    </script>
 </body>
 </html>
