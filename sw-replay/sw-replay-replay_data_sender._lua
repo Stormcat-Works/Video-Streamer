@@ -1,0 +1,332 @@
+--[[
+----------------------------------------------------------------------------------------------------
+author: makkiilikecat
+
+・・リプレイツールのアドオン・・
+Python側のサーバーにHTTP Getリクエストを使ってワールドのビークル情報を送信します。
+
+StormorksやHTTPサーバーの問題で、応答が10tick得られなかった場合、
+　送信停止フラグを建てて最大1分間バッファーに記録します。
+1秒に1回再試行して、応答を受け取り次第フラグを消します。
+バッファーに記録されたデータは文字数制限まで一括で送信します。
+HTTPサーバーに届かなかったデータと、バッファーを超えたデータは破棄されます。再送信機能はありません。
+----------------------------------------------------------------------------------------------------
+--]]
+
+-- ゲームのセーブデータに保存されるテーブル
+g_savedata = {}
+
+local announce, setPopupScreen, getVehiclePos, httpGet, getTimeMillisec = server.announce, server.setPopupScreen, server.getVehiclePos, server.httpGet, server.getTimeMillisec
+local insert, concat, remove, format, byte, pack, str_sub = table.insert, table.concat, table.remove, string.format, string.byte, string.pack, string.sub
+local atan, asin, max, floor = math.atan, math.asin, math.max, math.floor
+local retryTimer, pause_data_send, HTTP_STR_MAX_LENGTH, popup_response_body = -1, false, 4082, ""
+
+-- IEEE 754単精度浮動小数点数を16進数表現に変換する関数
+local function float_to_hex(f)
+    local packed_float = pack("f", f) -- 単精度浮動小数点数としてパック
+    local hex_string = ""
+    for i = 1, #packed_float do
+        hex_string = hex_string .. format("%02X", byte(packed_float, i))
+    end
+    return hex_string
+end
+
+-- 行列からオイラー角 (Yaw, Pitch, Roll) を抽出する関数（最適化版）
+local function matrix_to_euler(m)
+    local temp = m[2]
+    if temp*temp > 0.9999 then
+        return atan(-m[9], m[11]), 0, 0
+    else
+        return atan(m[3], m[1]), atan(-m[10], m[6]), asin(temp)
+    end
+end
+
+-- 管理者にポップアップを表示する関数
+local function admin_setPopupScreen(ui_id, name, is_show, text, horizontal_offset, vertical_offset)
+    for peer_id, data in pairs(g_savedata.adminList) do
+        setPopupScreen(peer_id, ui_id, name, is_show, text, horizontal_offset, vertical_offset)
+    end
+end
+
+-- 管理者にアナウンスする関数
+local function admin_announce(name, text)
+    for peer_id, data in pairs(g_savedata.adminList) do
+        announce(name, text, peer_id)
+    end
+end
+
+-- ビークル数をアナウンスする関数
+local function announceVehicleCount(func, name, message)
+    local vehicleCount = 0
+    for key, value in pairs(g_savedata.vehicle_ids) do if value then vehicleCount = vehicleCount + 1 end end
+    func(name, string.format(message, floor(vehicleCount)))
+end
+
+-- コマンドヘルプを表示する関数
+local function showHelp()
+    announce("Replay Script",
+        "-----------------------------------------------------------------------------Replay Script Command Help:\n\n[?replay (h|help)] - Show this help message.\n[?replay remove_save] - Remove the saved replay data and reset the script.\n-----------------------------------------------------------------------------"
+    )
+end
+
+-------------------------------------------------------------------------------------------------------------------------------------
+
+-- スクリプトがロードされたときに呼び出されるコールバック
+function onCreate(is_world_create)
+    g_savedata.vehicle_ids  = g_savedata.vehicle_ids or {}
+    g_savedata.tick_count   = g_savedata.tick_count or 0
+    g_savedata.bufferedData = g_savedata.bufferedData or {}
+    g_savedata.playerList   = g_savedata.playerList or {}
+    g_savedata.authList     = g_savedata.authList or {}
+    g_savedata.adminList    = g_savedata.adminList or {}
+    
+    if g_savedata.created then
+        g_savedata.loadCount = g_savedata.loadCount + 1
+        announceVehicleCount(announce, "Replay Script", "Replay Script Loaded from Save Data.\nLoadCount: " .. floor(g_savedata.loadCount) .. ", Vehicle Count: %d")
+    else
+        g_savedata.created = true
+        g_savedata.loadCount = 1
+        announce("Replay Script", "Replay Script Created")
+    end
+
+    --testProfiling()
+end
+
+function onDestroy()
+    announceVehicleCount(admin_announce, "Replay Script", "Replay Script Destroyed. Vehicle Count: %d")
+end
+
+-- ビークルがスポーンしたときに呼び出されるコールバック
+function onVehicleSpawn(vehicle_id)
+    g_savedata.vehicle_ids[vehicle_id] = -1
+    announceVehicleCount(admin_announce, "Replay Script", "Vehicle Spawned. Vehicle Count: %d")
+end
+
+-- ビークルがデスポーンしたときに呼び出されるコールバック
+function onVehicleDespawn(vehicle_id, is_instant)
+    g_savedata.vehicle_ids[vehicle_id] = nil
+    announceVehicleCount(admin_announce, "Replay Script", "Vehicle Despawned. Vehicle Count: %d")
+end
+
+-- プレイヤーが参加したときに呼び出されるコールバック
+function onPlayerJoin(steam_id, name, peer_id, is_admin, is_auth)
+    local data = {
+        steam_id = steam_id,
+        name = name,
+        is_admin = is_admin,
+        is_auth = is_auth
+    }
+    g_savedata.playerList[peer_id] = data
+    if is_auth then g_savedata.authList[peer_id] = data end
+    if is_admin then g_savedata.adminList[peer_id] = data end
+end
+
+-- プレイヤーが退出したときに呼び出されるコールバック
+function onPlayerLeave(steam_id, name, peer_id)
+    g_savedata.playerList[peer_id], g_savedata.authList[peer_id], g_savedata.adminList[peer_id] = nil
+end
+    
+-- ゲームの毎ティック呼び出されるコールバック
+function onTick()
+    g_savedata.tick_count = g_savedata.tick_count + 1
+    
+    retryTimer = max(retryTimer - 1, -1)
+    if retryTimer >= 0 then
+        -- HTTPエラーの旨をポップアップで管理者に表示
+        if retryTimer % 60 == 0 then
+            g_savedata.bufferedData = {} -- バッファをクリア
+            admin_setPopupScreen(
+                "replay_http_error_popup", "Replay Script Error", true, 
+                "Retrying in " .. floor(retryTimer/60) .. " seconds...", 0, 0)
+        end
+        return
+    end
+
+    local current_tick_data = {}
+
+    for vehicle_id, _ in pairs(g_savedata.vehicle_ids) do
+        is_simulating, is_success = server.getVehicleSimulating(vehicle_id)
+        if not is_success then return end
+
+        -- 一度も送信されていないか、シミュレーションされているビークル
+        if g_savedata.vehicle_ids[vehicle_id] < 1 or is_simulating then
+            g_savedata.vehicle_ids[vehicle_id] = is_simulating and 0 or 1
+
+            local vehicle_matrix, is_success = getVehiclePos(vehicle_id)
+            if not is_success then return end
+            
+            -- 位置の抽出 (matrix[13]=x, matrix[14]=y, matrix[15]=z)
+            -- local pos_x, pos_y, pos_z = vehicle_matrix[13], vehicle_matrix[14], vehicle_matrix[15]
+            -- announce("Replay Script", 
+            --     string.format("Vehicle %d Position: (%.2f, %.2f, %.2f)", vehicle_id, pos_x, pos_y, pos_z))
+
+            -- オイラー角の抽出 (Roll, Pitch, Yaw)
+            local euler_x, euler_y, euler_z = matrix_to_euler(vehicle_matrix)
+            -- announce("Replay Script", 
+            --     string.format("Vehicle %d Orientation: (%.2f, %.2f, %.2f)", vehicle_id, euler_x, euler_y, euler_z))
+
+            -- 各数値を16進数表現に変換、データ文字列を構築
+            insert(current_tick_data, 
+                format("%d_%s_%s_%s_%s_%s_%s", vehicle_id,
+                    float_to_hex(vehicle_matrix[13]), float_to_hex(vehicle_matrix[14]), float_to_hex(vehicle_matrix[15]),
+                    float_to_hex(euler_x), float_to_hex(euler_y), float_to_hex(euler_z)))
+        end
+    end
+
+    -- 現在のティックのデータをバッファに追加
+    -- 空のティックデータは追加しない
+    -- 10秒以上は追加しない
+    if #current_tick_data > 0 and #g_savedata.bufferedData < 3600 then
+        insert(g_savedata.bufferedData, concat(current_tick_data, "-"))     -- 各tickの文字列　　　　#bufferedData[i]      = 各tickの文字数
+        --insert(g_savedata.bufferVehicleData, current_tick_data)             -- 各tickのビークル情報　#bufferVehicleData[i] = 各tickのビークル数
+    end
+
+    -- 送信一時停止中でない、かつバッファにデータがある場合に送信
+    if pause_data_send then
+        admin_setPopupScreen(
+            "replay_http_pause_popup", "Replay Script Error", true, 
+            "bufferDataCount: " .. floor(#g_savedata.bufferedData), 0, 0)
+    end
+    if not pause_data_send or g_savedata.tick_count % 60 == 0 then  -- 1秒に1回再試行
+        if #g_savedata.bufferedData > 0 then
+            local str_length = 13   -- パスの長さ
+            local send_data = {}
+            for i, tick_data_str in ipairs(g_savedata.bufferedData) do
+                str_length = str_length + #tick_data_str + 1   -- tick間を繋ぐ"|"の分
+                if str_length < HTTP_STR_MAX_LENGTH then       -- 文字数制限以下になるように
+                    insert(send_data, tick_data_str)
+                else
+                    break
+                end
+            end
+
+            httpGet(8000, "/replay_" .. floor(g_savedata.tick_count) .. "?" .. concat(send_data, "|"))
+            -- 送信したデータをバッファから削除
+            for k = 1, #send_data do
+                remove(g_savedata.bufferedData, 1)
+            end
+        end
+
+        if #g_savedata.bufferedData <= 5 then
+            admin_setPopupScreen(
+                "replay_http_pause_popup", "Replay Script Error", false, "", 0, 0)
+        end
+    end
+end
+
+function httpReply(port, request_body, response_body)
+    if port == 8000 then
+        local _, _, received_tick_str = string.find(string.sub(request_body, 1, 15), "/replay_(%d+)")
+        local received_tick = tonumber(received_tick_str)
+
+        if response_body == "OK" then
+            pause_data_send = false
+        else
+            -- admin_announce("Replay Script", "HTTP Reply Error.\nResponseBody: [" ..  response_body .. "]")
+            popup_response_body = response_body
+            retryTimer = 600
+        end
+
+        if received_tick then
+            if received_tick and g_savedata.tick_count - received_tick > 10 then
+                pause_data_send = true
+                -- admin_announce("Replay Script", "Tick difference too large. Pausing data sending.")
+            end
+        else
+            admin_announce("Replay Script", "Invalid tick number in request: " .. tostring(received_tick_str))
+        end
+    end
+end
+
+function onCustomCommand(full_message, user_peer_id, is_admin, is_auth, command, arg1)
+    if command ~= "?replay" then return end
+
+    if arg1 == "remove_save" then
+        onDestroy()
+        g_savedata = {}
+        onCreate()
+    elseif arg1 == "h" or arg1 == "help" then
+        showHelp()
+    else
+        showHelp()
+    end
+end
+
+
+local function profiler(func, num_iterations,  ...)
+    local start_time, result = getTimeMillisec()
+    for i = 0, num_iterations do
+        result = func(...)
+    end
+    local end_time = getTimeMillisec()
+    local elapsed_time = end_time - start_time
+    return start_time, end_time, elapsed_time, result
+end
+
+local elapsed_times = {}
+function onTick_()
+    local _, _, elapsed_time = profiler(onTick_, 100)
+    insert(elapsed_times, elapsed_time)
+
+    if #elapsed_times >= 60 then
+        local min_val = elapsed_times[1]
+        local max_val = elapsed_times[1]
+        local sum_val = 0
+
+        for i, v in ipairs(elapsed_times) do
+            if v < min_val then min_val = v end
+            if v > max_val then max_val = v end
+            sum_val = sum_val + v
+        end
+
+        announce("Replay Script", "Tick Profiler Results: " ..
+            format("Min: %.2f ms, Max: %.2f ms, Ave: %.2f ms",
+                min_val, max_val, #elapsed_times > 0 and sum_val / #elapsed_times or 0))
+        
+        elapsed_times = {}
+    end
+end
+
+local function testProfiling()
+    local elapsed_times = {}
+    for i = 1, 100 do
+        -- 乱数で行列を作成
+        -- [1, 0, 0, 0]
+        -- [0, 1, 0, 0]
+        -- [0, 0, 1, 0]
+        -- [1234.56, 2345.67, 3456.78, 1]
+
+        local sampleMatrix = {}
+        for i = 1, 3 do
+            sampleMatrix[i*4] = 0
+            local sum = 0
+            for j = 1, 3 do
+                local value = math.random()
+                sampleMatrix[i*4-4+j] = value
+                local sum = sum + value
+            end
+            for j = 1, 3 do
+                local index = i*4-4+j
+                sampleMatrix[index] = sum ~= 0 and sampleMatrix[index] / sum or 0
+            end
+        end
+
+        local num_iterations = 10000
+        _, _, elapsed_time, result = profiler(matrix_to_euler, num_iterations, sampleMatrix)
+        elapsed_times[i] = elapsed_time
+    end
+
+    local min_val = elapsed_times[1]
+    local max_val = elapsed_times[1]
+    local sum_val = 0
+
+    for i, v in ipairs(elapsed_times) do
+        if v < min_val then min_val = v end
+        if v > max_val then max_val = v end
+        sum_val = sum_val + v
+    end
+
+    announce("Replay Script", "Profiler Results: " ..
+        format("Min: %.2f ms, Max: %.2f ms, Ave: %.2f ms",
+            min_val, max_val, #elapsed_times > 0 and sum_val / #elapsed_times or 0))
+end
