@@ -58,6 +58,25 @@ class PaletteManager {
 }
 const paletteManager = new PaletteManager();
 
+// RLEエンコードを行うヘルパー関数
+function rleEncode<T>(data: T[]): [T, number][] {
+    if (data.length === 0) return [];
+    const encoded: [T, number][] = [];
+    let current = data[0];
+    let count = 1;
+    for (let i = 1; i < data.length; i++) {
+        if (data[i] === current) {
+            count++;
+        } else {
+            encoded.push([current, count]);
+            current = data[i];
+            count = 1;
+        }
+    }
+    encoded.push([current, count]);
+    return encoded;
+}
+
 
 // HTTPサーバーとビデオ処理プロセスのインスタンス
 let server: http.Server | null = null;
@@ -200,6 +219,19 @@ function startServer(port: number) {
                 if (diffs.length > 0) candidates['D'] = "D|" + diffs.join('|');
             }
 
+            // 3. フルRLE (FR)
+            const hexColors = [];
+            for (let i = 0; i < currentFrame.length; i += 3) {
+                const r = currentFrame[i].toString(16).padStart(2, '0');
+                const g = currentFrame[i+1].toString(16).padStart(2, '0');
+                const b = currentFrame[i+2].toString(16).padStart(2, '0');
+                hexColors.push(`${r}${g}${b}`);
+            }
+            const rleFullData = rleEncode(hexColors);
+            if (rleFullData.length > 0) {
+                candidates['FR'] = "FR|" + rleFullData.map(([color, count]) => `${color},${count.toString(16)}`).join('|');
+            }
+
             // --- インデックス系エンコード ---
             const uniqueColors = new Map<string, number[]>();
             for (let i = 0; i < currentFrame.length; i += 3) {
@@ -216,15 +248,21 @@ function startServer(port: number) {
                 const palettePayload = sendPaletteData ? palette.map(c => c.map(v => v.toString(16).padStart(2, '0')).join('')).join(',') : "";
                 const hexFormat = (n: number) => (colors.length <= 16 ? n.toString(16) : n.toString(16).padStart(2, '0'));
 
-                // 3. インデックス (I)
-                const indices = [];
+                // 4. インデックス (I)
+                const indices: number[] = [];
                 for (let i = 0; i < currentFrame.length; i += 3) {
                     const key = `${currentFrame[i]},${currentFrame[i+1]},${currentFrame[i+2]}`;
-                    indices.push(hexFormat(colorToIndex.get(key)!));
+                    indices.push(colorToIndex.get(key)!);
                 }
-                candidates['I'] = `I|${id}|${palettePayload}|${indices.join('')}`;
+                candidates['I'] = `I|${id}|${palettePayload}|${indices.map(hexFormat).join('')}`;
 
-                // 4. 差分インデックス (DI)
+                // 5. インデックスRLE (IR)
+                const rleIndexedData = rleEncode(indices);
+                if (rleIndexedData.length > 0) {
+                    candidates['IR'] = `IR|${id}|${palettePayload}|${rleIndexedData.map(([index, count]) => `${hexFormat(index)},${count.toString(16)}`).join('|')}`;
+                }
+
+                // 6. 差分インデックス (DI)
                 if (prevFrameBuffer) {
                     const diffs: string[] = [];
                     for (let i = 0; i < currentFrame.length; i += 3) {
