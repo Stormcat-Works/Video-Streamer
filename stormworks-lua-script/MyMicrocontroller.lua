@@ -16,8 +16,8 @@
 -- Pythonサーバーのポート番号
 local SERVER_PORT = 8000
 -- 画像の解像度
-local IMAGE_WIDTH = 64
-local IMAGE_HEIGHT = 64
+local IMAGE_WIDTH = 200
+local IMAGE_HEIGHT = 150
 -- パレットキャッシュの最大保持数 (Python側と合わせる)
 local MAX_PALETTES_TO_KEEP = 500
 
