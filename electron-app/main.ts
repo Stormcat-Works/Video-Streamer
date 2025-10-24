@@ -14,6 +14,50 @@ import { PassThrough } from 'stream';
 const IMG_WIDTH = 200;
 const IMG_HEIGHT = 150;
 const CHUNK_SIZE_LIMIT = 4000;
+const MAX_PALETTE_COLORS = 256;
+const MAX_PALETTES_TO_KEEP = 500;
+
+// --- パレット管理 ---
+type Palette = { colors: number[][]; colorsTuple: string };
+class PaletteManager {
+    private palettes: Map<number, Palette> = new Map();
+    private lruKeys: number[] = [];
+    private nextPaletteId = 0;
+
+    getOrCreatePalette(colors: number[][]): { id: number; isNew: boolean; palette: number[][] } {
+        const colorsTuple = JSON.stringify(colors); // 簡単なハッシュ化
+        
+        for (const [id, paletteData] of this.palettes.entries()) {
+            if (paletteData.colorsTuple === colorsTuple) {
+                this.updateLru(id);
+                return { id, isNew: false, palette: paletteData.colors };
+            }
+        }
+
+        const newId = this.nextPaletteId++;
+        this.palettes.set(newId, { colors, colorsTuple });
+        this.updateLru(newId);
+
+        if (this.lruKeys.length > MAX_PALETTES_TO_KEEP) {
+            const oldestKey = this.lruKeys.shift();
+            if (oldestKey !== undefined) {
+                this.palettes.delete(oldestKey);
+            }
+        }
+        
+        return { id: newId, isNew: true, palette: colors };
+    }
+
+    private updateLru(id: number) {
+        const index = this.lruKeys.indexOf(id);
+        if (index > -1) {
+            this.lruKeys.splice(index, 1);
+        }
+        this.lruKeys.push(id);
+    }
+}
+const paletteManager = new PaletteManager();
+
 
 // HTTPサーバーとビデオ処理プロセスのインスタンス
 let server: http.Server | null = null;
@@ -21,6 +65,8 @@ let ffmpegProcess: ffmpeg.FfmpegCommand | null = null;
 
 // 最新のビデオフレームを保持するバッファ
 let frameBuffer: Buffer[] = [];
+// 差分比較のために直前のフレームを保持するバッファ
+let prevFrameBuffer: Buffer | null = null;
 // 送信中のフレームのチャンクを保持するマップ
 const IMAGE_CHUNKS: Map<string, string[]> = new Map();
 
@@ -129,31 +175,96 @@ function startServer(port: number) {
                 res.status(503).send('No frame available yet.');
                 return;
             }
-            const pixels = frameBuffer[0];
+            const currentFrame = frameBuffer[0];
+            const clientCachedPids = new Set(
+                (req.query.cached_pids as string || '').split(',').map(p => parseInt(p, 10)).filter(p => !isNaN(p))
+            );
 
-            // 'F' (Full) 形式でエンコード
-            const encodedData = "F|" + pixels.toString('base64');
+            const candidates: { [key: string]: string | null } = {};
+
+            // 1. フルフレーム (F)
+            candidates['F'] = "F|" + currentFrame.toString('base64');
+
+            // 2. 差分 (D)
+            if (prevFrameBuffer) {
+                const diffs: string[] = [];
+                for (let i = 0; i < currentFrame.length; i += 3) {
+                    if (currentFrame[i] !== prevFrameBuffer[i] || currentFrame[i+1] !== prevFrameBuffer[i+1] || currentFrame[i+2] !== prevFrameBuffer[i+2]) {
+                        const pixelIndex = i / 3;
+                        const r = currentFrame[i].toString(16).padStart(2, '0');
+                        const g = currentFrame[i+1].toString(16).padStart(2, '0');
+                        const b = currentFrame[i+2].toString(16).padStart(2, '0');
+                        diffs.push(`${pixelIndex.toString(16)}:${r}${g}${b}`);
+                    }
+                }
+                if (diffs.length > 0) candidates['D'] = "D|" + diffs.join('|');
+            }
+
+            // --- インデックス系エンコード ---
+            const uniqueColors = new Map<string, number[]>();
+            for (let i = 0; i < currentFrame.length; i += 3) {
+                const r = currentFrame[i], g = currentFrame[i+1], b = currentFrame[i+2];
+                uniqueColors.set(`${r},${g},${b}`, [r, g, b]);
+            }
+            const colors = Array.from(uniqueColors.values());
+
+            if (colors.length > 1 && colors.length <= MAX_PALETTE_COLORS) {
+                const { id, isNew, palette } = paletteManager.getOrCreatePalette(colors);
+                const colorToIndex = new Map(palette.map((c, i) => [c.join(','), i]));
+                
+                const sendPaletteData = isNew || !clientCachedPids.has(id);
+                const palettePayload = sendPaletteData ? palette.map(c => c.map(v => v.toString(16).padStart(2, '0')).join('')).join(',') : "";
+                const hexFormat = (n: number) => (colors.length <= 16 ? n.toString(16) : n.toString(16).padStart(2, '0'));
+
+                // 3. インデックス (I)
+                const indices = [];
+                for (let i = 0; i < currentFrame.length; i += 3) {
+                    const key = `${currentFrame[i]},${currentFrame[i+1]},${currentFrame[i+2]}`;
+                    indices.push(hexFormat(colorToIndex.get(key)!));
+                }
+                candidates['I'] = `I|${id}|${palettePayload}|${indices.join('')}`;
+
+                // 4. 差分インデックス (DI)
+                if (prevFrameBuffer) {
+                    const diffs: string[] = [];
+                    for (let i = 0; i < currentFrame.length; i += 3) {
+                         if (currentFrame[i] !== prevFrameBuffer[i] || currentFrame[i+1] !== prevFrameBuffer[i+1] || currentFrame[i+2] !== prevFrameBuffer[i+2]) {
+                            const pixelIndex = i / 3;
+                            const key = `${currentFrame[i]},${currentFrame[i+1]},${currentFrame[i+2]}`;
+                            diffs.push(`${pixelIndex.toString(16)}:${hexFormat(colorToIndex.get(key)!)}`);
+                        }
+                    }
+                    if (diffs.length > 0) candidates['DI'] = `DI|${id}|${palettePayload}|${diffs.join('|')}`;
+                }
+            }
+
+            // --- 最もデータサイズが小さい形式を選択 ---
+            const validCandidates = Object.values(candidates).filter((p): p is string => p !== null);
+            if (validCandidates.length === 0) {
+                res.status(204).send();
+                return;
+            }
+            const bestPayload = validCandidates.reduce((a, b) => (a.length < b.length ? a : b));
             
             // データをチャンクに分割
             const chunks = [];
-            for (let i = 0; i < encodedData.length; i += CHUNK_SIZE_LIMIT) {
-                chunks.push(encodedData.substring(i, i + CHUNK_SIZE_LIMIT));
+            for (let i = 0; i < bestPayload.length; i += CHUNK_SIZE_LIMIT) {
+                chunks.push(bestPayload.substring(i, i + CHUNK_SIZE_LIMIT));
             }
             
             const frameId = crypto.randomUUID();
             IMAGE_CHUNKS.set(frameId, chunks);
             
-            // 古いチャンクを削除
             if (IMAGE_CHUNKS.size > 10) {
                 const oldestKey = IMAGE_CHUNKS.keys().next().value;
-                if (oldestKey) {
-                    IMAGE_CHUNKS.delete(oldestKey);
-                }
+                if (oldestKey) IMAGE_CHUNKS.delete(oldestKey);
             }
 
             const totalChunks = chunks.length;
             const responseBody = `${frameId};${totalChunks}`;
             res.send(responseBody);
+
+            prevFrameBuffer = Buffer.from(currentFrame);
 
         } else if (action === 'get_chunk') {
             const frameId = req.query.frame_id;
@@ -198,6 +309,7 @@ function stopServer() {
         ffmpegProcess.kill('SIGKILL');
         ffmpegProcess = null;
         frameBuffer = [];
+        prevFrameBuffer = null; // 前フレームバッファもクリア
         console.log('FFmpeg process stopped.');
     }
 
