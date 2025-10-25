@@ -4,33 +4,51 @@
     <meta charset="UTF-8">
     <title>Stormworks Video Streamer</title>
     <style>
-        body { font-family: sans-serif; padding: 20px; }
-        .control-group { margin-bottom: 15px; }
-        label { margin-right: 10px; }
-        input { width: 80px; }
-        button { margin-right: 10px; }
+        body { font-family: sans-serif; padding: 20px; background-color: #f4f4f4; }
+        h1 { color: #333; }
+        .container { max-width: 800px; margin: 0 auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .control-group { margin-bottom: 20px; }
+        label { margin-right: 10px; font-weight: bold; }
+        input[type="number"] { width: 80px; padding: 5px; border-radius: 4px; border: 1px solid #ccc; }
+        button { margin-right: 10px; padding: 10px 15px; border: none; border-radius: 4px; color: #fff; cursor: pointer; }
+        #startButton { background-color: #28a745; }
+        #stopButton { background-color: #dc3545; }
+        #playPauseButton { background-color: #007bff; }
+        button:disabled { background-color: #6c757d; cursor: not-allowed; }
         #status { font-weight: bold; }
-        .running { color: green; }
-        .stopped { color: red; }
-        .error { color: orange; }
+        .running { color: #28a745; }
+        .stopped { color: #dc3545; }
+        .error { color: #ffc107; }
+        #video-preview { width: 100%; max-width: 400px; background-color: #000; border: 1px solid #ccc; margin-top: 10px; }
+        #seekBar { width: 100%; max-width: 400px; }
     </style>
 </head>
 <body>
-    <h1>Stormworks Video Streamer</h1>
+    <div class="container">
+        <h1>Stormworks Video Streamer</h1>
 
-    <div class="control-group">
-        <label for="port">Server Port:</label>
-        <input type="number" id="port" value="8000">
-    </div>
+        <div class="control-group">
+            <label for="port">Server Port:</label>
+            <input type="number" id="port" value="8000">
+        </div>
 
-    <div class="control-group">
-        <button id="startButton">Start Server</button>
-        <button id="stopButton" disabled>Stop Server</button>
-    </div>
+        <div class="control-group">
+            <button id="startButton">Start Server</button>
+            <button id="stopButton" disabled>Stop Server</button>
+        </div>
 
-    <div class="control-group">
-        <p>Status: <span id="status" class="stopped">Stopped</span></p>
-        <p id="status-details"></p>
+        <div class="control-group">
+            <p>Status: <span id="status" class="stopped">Stopped</span></p>
+            <p id="status-details"></p>
+        </div>
+
+        <div class="control-group">
+            <h2>Preview & Control</h2>
+            <video id="video-preview" muted></video>
+            <br>
+            <button id="playPauseButton" disabled>Play/Pause</button>
+            <input type="range" id="seekBar" value="0" min="0" max="100" step="0.1" style="width: 400px;" disabled>
+        </div>
     </div>
 
     <script>
@@ -39,7 +57,14 @@
         const stopButton = document.getElementById('stopButton');
         const statusEl = document.getElementById('status');
         const statusDetailsEl = document.getElementById('status-details');
+        const videoPreview = document.getElementById('video-preview');
+        const playPauseButton = document.getElementById('playPauseButton');
+        const seekBar = document.getElementById('seekBar');
 
+        let isPlaying = false;
+        let wasPlayingBeforeSeek = false; // シーク開始前の再生状態を保持
+
+        // --- サーバー制御 ---
         startButton.addEventListener('click', () => {
             const port = parseInt(portInput.value, 10);
             if (port > 0) {
@@ -51,35 +76,98 @@
             window.api.stopServer();
         });
 
-        // メインプロセスからのサーバー状態通知をリッスン
-        window.api.onServerStatus((status, ...args) => {
-            switch (status) {
-                case 'running':
-                    statusEl.textContent = `Running on port ${args[0]}`;
-                    statusEl.className = 'running';
-                    statusDetailsEl.textContent = '';
-                    startButton.disabled = true;
-                    stopButton.disabled = false;
-                    portInput.disabled = true;
-                    break;
-                case 'stopped':
-                    statusEl.textContent = 'Stopped';
-                    statusEl.className = 'stopped';
-                    statusDetailsEl.textContent = '';
-                    startButton.disabled = false;
-                    stopButton.disabled = true;
-                    portInput.disabled = false;
-                    break;
-                case 'error':
-                    statusEl.textContent = 'Error';
-                    statusEl.className = 'error';
-                    statusDetailsEl.textContent = `Error: ${args[0]}`;
-                    startButton.disabled = false;
-                    stopButton.disabled = true;
-                    portInput.disabled = false;
-                    break;
+        // --- 再生制御 ---
+        playPauseButton.addEventListener('click', () => {
+            if (videoPreview.paused) {
+                videoPreview.play().catch(e => console.error("Video play failed:", e));
+            } else {
+                videoPreview.pause();
             }
         });
+
+        // --- シーク制御 ---
+        seekBar.addEventListener('mousedown', () => {
+            wasPlayingBeforeSeek = !videoPreview.paused;
+            if (wasPlayingBeforeSeek) {
+                videoPreview.pause();
+            }
+        });
+
+        seekBar.addEventListener('input', () => {
+            // ドラッグ中はプレビューの再生位置のみ更新
+            videoPreview.currentTime = parseFloat(seekBar.value);
+        });
+
+        seekBar.addEventListener('mouseup', () => {
+            const seekTime = parseFloat(seekBar.value);
+            // 操作完了時にバックエンドに通知
+            window.api.seekVideo(seekTime);
+            if (wasPlayingBeforeSeek) {
+                videoPreview.play().catch(e => console.error("Video play failed:", e));
+            }
+        });
+
+        // --- アプリ起動時にビデオパスを設定 ---
+        window.api.getVideoPath().then(videoPath => {
+            videoPreview.src = videoPath;
+        }).catch(err => {
+            console.error("Failed to get video path:", err);
+            statusEl.textContent = 'Error';
+            statusEl.className = 'error';
+            statusDetailsEl.textContent = 'Could not load video file.';
+        });
+
+        // --- メインプロセスからのイベントリスナー ---
+        window.api.onServerStatus((status, ...args) => {
+            const isServerRunning = status === 'running';
+            
+            statusEl.textContent = isServerRunning ? `Running on port ${args[0]}` : (status === 'stopped' ? 'Stopped' : 'Error');
+            statusEl.className = status;
+            statusDetailsEl.textContent = status === 'error' ? `Error: ${args[0]}` : '';
+
+            startButton.disabled = isServerRunning;
+            stopButton.disabled = !isServerRunning;
+            portInput.disabled = isServerRunning;
+            playPauseButton.disabled = !isServerRunning;
+            seekBar.disabled = !isServerRunning;
+
+            if (isServerRunning) {
+                videoPreview.play().catch(e => console.error("Video play failed:", e));
+                isPlaying = true;
+                playPauseButton.textContent = 'Pause';
+            } else {
+                videoPreview.pause();
+                isPlaying = false;
+                playPauseButton.textContent = 'Play/Pause';
+            }
+        });
+
+        // ビデオのメタデータが読み込まれたら、シークバーの最大値を設定
+        videoPreview.addEventListener('loadedmetadata', () => {
+            seekBar.max = videoPreview.duration;
+        });
+
+        // ビデオの再生時間が更新されたら、シークバーとUIに反映
+        videoPreview.addEventListener('timeupdate', () => {
+            seekBar.value = videoPreview.currentTime;
+        });
+
+        // プレビュービデオの再生/一時停止をUIボタンと同期
+        videoPreview.addEventListener('play', () => {
+            if (!isPlaying) {
+                isPlaying = true;
+                playPauseButton.textContent = 'Pause';
+                window.api.togglePlayback(true);
+            }
+        });
+        videoPreview.addEventListener('pause', () => {
+            if (isPlaying) {
+                isPlaying = false;
+                playPauseButton.textContent = 'Play';
+                window.api.togglePlayback(false);
+            }
+        });
+
     </script>
 </body>
 </html>

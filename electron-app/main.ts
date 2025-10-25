@@ -89,6 +89,10 @@ let prevFrameBuffer: Buffer | null = null;
 // 送信中のフレームのチャンクを保持するマップ
 const IMAGE_CHUNKS: Map<string, string[]> = new Map();
 
+// 再生状態の管理
+let isPaused = false;
+let currentSeekTime = 0;
+
 
 let mainWindow: BrowserWindow | null;
 
@@ -100,6 +104,8 @@ function createWindow() {
             preload: path.join(__dirname, 'preload.js'),
             contextIsolation: true,
             nodeIntegration: false,
+            // preloadスクリプトで'path'などのNode.jsモジュールを使用できるようにするため、サンドボックスを無効にします。
+            sandbox: false,
         },
     });
 
@@ -113,7 +119,13 @@ function createWindow() {
 // --- ここからビデオ処理ロジック ---
 
 // FFmpegを使用してビデオからフレームを抽出する関数
-function setupVideoCapture() {
+function setupVideoCapture(startTime: number = 0) {
+    // 既存のプロセスがあれば停止
+    if (ffmpegProcess) {
+        ffmpegProcess.kill('SIGKILL');
+        ffmpegProcess = null;
+    }
+
     // 実行時の`dist`ディレクトリからの相対パスでビデオファイルを探す
     const videoPath = path.join(__dirname, '../../python-version/video.mp4');
 
@@ -148,24 +160,26 @@ function setupVideoCapture() {
 
     // FFmpegプロセスを開始
     ffmpegProcess = ffmpeg(videoPath);
+    if (startTime > 0) {
+        ffmpegProcess.inputOptions(`-ss ${startTime}`);
+    }
     ffmpegProcess.inputOptions('-re') // ネイティブのフレームレートで読み込む
         .outputOptions([
             '-f', 'rawvideo',      // 生のビデオデータとして出力
             '-pix_fmt', 'rgb24',   // ピクセルフォーマットをRGB24に
             '-s', `${IMG_WIDTH}x${IMG_HEIGHT}` // 解像度を指定
         ])
-        .on('start', () => console.log('FFmpeg processing started.'))
+        .on('start', (commandLine) => console.log(`FFmpeg started: ${commandLine}`))
         .on('error', (err) => {
+            // 意図的な停止(kill)によるエラーは無視
+            if (err.message.includes('SIGKILL')) return;
             console.error('FFmpeg error:', err.message);
-            // エラーが発生したら再起動してループさせる
-            if (ffmpegProcess) {
-                setTimeout(setupVideoCapture, 1000);
-            }
         })
         .on('end', () => {
             console.log('Video ended, looping...');
-            // 動画が終了したら再起動してループさせる
+            // 動画が終了したらループさせる
             if (ffmpegProcess) {
+                currentSeekTime = 0;
                 setupVideoCapture();
             }
         });
@@ -179,6 +193,9 @@ function startServer(port: number) {
         console.log('Server is already running.');
         return;
     }
+    
+    isPaused = false;
+    currentSeekTime = 0;
 
     // ビデオキャプチャを開始
     setupVideoCapture();
@@ -368,6 +385,35 @@ ipcMain.on('start-server', (event, port) => {
 
 ipcMain.on('stop-server', () => {
     stopServer();
+});
+
+ipcMain.on('toggle-playback', (event, shouldPlay) => {
+    if (isPaused === !shouldPlay) return; // 状態が同じなら何もしない
+
+    isPaused = !shouldPlay;
+    console.log(`Playback toggled. isPaused: ${isPaused}`);
+
+    if (isPaused) {
+        if (ffmpegProcess) {
+            ffmpegProcess.kill('SIGKILL');
+            ffmpegProcess = null;
+        }
+    } else {
+        if (!ffmpegProcess) {
+            setupVideoCapture(currentSeekTime);
+        }
+    }
+});
+
+ipcMain.on('seek-video', (event, time) => {
+    console.log(`Seek request to: ${time}`);
+    currentSeekTime = time;
+    prevFrameBuffer = null; // シーク後は差分が取れないのでリセット
+
+    // 一時停止中でなければ、シーク後に再生を再開
+    if (!isPaused) {
+        setupVideoCapture(currentSeekTime);
+    }
 });
 
 
